@@ -68,6 +68,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg
 <div class="kpi"><div class="v" id="kRsi">--</div><div class="l">RSI(14)</div></div>
 <div class="kpi"><div class="v" id="kBias">--</div><div class="l">BIAS(20)</div></div>
 </div>
+<div class="row">
+<div class="kpi"><div class="v" id="kDivYield">--</div><div class="l">股息率</div></div>
+<div class="kpi"><div class="v" id="kDivPct">--</div><div class="l">股息率百分位</div></div>
+</div>
 </div>
 
 <div class="card">
@@ -135,6 +139,38 @@ const bar=c.map((_,i)=>dif[i]!==null&&dea[i]!==null?2*(dif[i]-dea[i]):null);
 return {dif,dea,bar};
 }
 
+// ===== DIVIDEND YIELD PERCENTILE =====
+function calcDividendYield(data) {
+// Calculate rolling 12-month dividend yield from unitMoney field
+const yields = [];
+const msPerYear = 365.25 * 86400000;
+for (let i = 0; i < data.length; i++) {
+const now = data[i].ts;
+const oneYearAgo = now - msPerYear;
+// Sum dividends in trailing 12 months
+let annualDiv = 0;
+for (let j = i; j >= 0; j--) {
+if (data[j].ts < oneYearAgo) break;
+if (data[j].div > 0) annualDiv += data[j].div;
+}
+const yield_ = data[i].close > 0 ? annualDiv / data[i].close * 100 : 0;
+yields.push(yield_);
+}
+
+// Calculate percentile for each point (trailing 252 trading days)
+const percentiles = yields.map((y, i) => {
+const window = 252;
+const start = Math.max(0, i - window + 1);
+const slice = yields.slice(start, i + 1).filter(v => v > 0);
+if (slice.length < 20) return null;
+const sorted = [...slice].sort((a, b) => a - b);
+const rank = sorted.filter(v => v <= y).length;
+return rank / sorted.length * 100;
+});
+
+return { yields, percentiles };
+}
+
 // ===== SIGNAL ENGINE =====
 function analyze(data) {
 const closes = data.map(d => d.close);
@@ -149,6 +185,7 @@ const macd = calcMACD(closes);
 const ma5 = sma(closes, 5);
 const ma20 = sma(closes, 20);
 const ma60 = sma(closes, 60);
+const divYield = calcDividendYield(data);
 
 // Current values
 const cur = {
@@ -164,6 +201,8 @@ macdDea: macd.dea[last],
 ma5: ma5[last],
 ma20: ma20[last],
 ma60: ma60[last],
+divYield: divYield.yields[last],
+divPct: divYield.percentiles[last],
 };
 
 // Evaluate signals (based on validated research)
@@ -212,6 +251,18 @@ else if (!above60 && !ma5gt20) signals.push({ name: '均线', val: '空头排列
 else signals.push({ name: '均线', val: '混合', level: 'neutral', desc: '均线方向不一致', weight: 0 });
 }
 
+// Dividend yield percentile (core fundamental signal)
+const dp = cur.divPct;
+const dy = cur.divYield;
+if (dp !== null && dy > 0) {
+if (dp > 85) signals.push({ name: '股息率百分位', val: `${dp.toFixed(0)}% (${dy.toFixed(2)}%)`, level: 'strong_buy', desc: '股息率处于历史高位，估值极低，强烈买入', weight: 3.5 });
+else if (dp > 70) signals.push({ name: '股息率百分位', val: `${dp.toFixed(0)}% (${dy.toFixed(2)}%)`, level: 'buy', desc: '股息率偏高，估值偏低，适合买入', weight: 2.5 });
+else if (dp > 50) signals.push({ name: '股息率百分位', val: `${dp.toFixed(0)}% (${dy.toFixed(2)}%)`, level: 'weak_buy', desc: '股息率中等偏上，估值合理', weight: 1 });
+else if (dp < 15) signals.push({ name: '股息率百分位', val: `${dp.toFixed(0)}% (${dy.toFixed(2)}%)`, level: 'strong_sell', desc: '股息率处于历史低位，估值极高，谨慎', weight: 3.5 });
+else if (dp < 30) signals.push({ name: '股息率百分位', val: `${dp.toFixed(0)}% (${dy.toFixed(2)}%)`, level: 'sell', desc: '股息率偏低，估值偏高', weight: 2 });
+else signals.push({ name: '股息率百分位', val: `${dp.toFixed(0)}% (${dy.toFixed(2)}%)`, level: 'neutral', desc: '股息率中等，估值正常', weight: 0 });
+}
+
 // ===== Composite decision =====
 let score = 0, totalW = 0;
 const levelMap = { strong_buy: 2, buy: 1.5, weak_buy: 1, neutral: 0, weak_sell: -1, sell: -1.5, strong_sell: -2 };
@@ -221,14 +272,22 @@ const normScore = totalW > 0 ? score / totalW : 0;
 // Validated combo signal
 const comboBuy = bias20Val < -3 && rsi14Val < 35 && rsi14Val !== null && bias20Val !== null;
 const comboBuyLight = bias20Val < -2 && rsi14Val < 40 && rsi14Val !== null && bias20Val !== null;
+const divCheap = dp !== null && dp > 70;
+const divVeryCheap = dp !== null && dp > 85;
 
 let action, icon, desc;
-if (comboBuy) {
+if (comboBuy && divCheap) {
 action = '强烈买入'; icon = '🟢🟢'; 
-desc = 'BIAS(20)<-3% + RSI(14)<35 同时触发！这是经过回测验证的最强买入信号（100%胜率，平均超额+35.5%）。建议：波段仓位加至30%上限，持有20个交易日后卖出。';
-} else if (normScore > 0.8) {
+desc = '技术面+基本面双重确认！BIAS(20)<-3% + RSI(14)<35（回测100%胜率）且股息率处于历史高位（估值低）。建议：波段仓位加至30%上限，持有20个交易日后卖出。';
+} else if (comboBuy) {
+action = '强烈买入'; icon = '🟢🟢'; 
+desc = 'BIAS(20)<-3% + RSI(14)<35 同时触发！经过回测验证的最强买入信号（100%胜率，平均超额+35.5%）。建议：波段仓位加至30%上限，持有20个交易日后卖出。';
+} else if (divVeryCheap) {
 action = '加仓买入'; icon = '🟢';
-desc = '多个指标指向买入。建议：将波段仓位加至20%。';
+desc = `股息率处于历史${dp.toFixed(0)}%高分位，估值极低。即使技术面偏弱，长期持有收益确定性高。建议：底仓可适当加码。`;
+} else if (normScore > 0.8 && divCheap) {
+action = '加仓买入'; icon = '🟢';
+desc = '技术面偏多+估值偏低，双因素支持买入。建议：波段仓位加至20%。';
 } else if (normScore > 0.3) {
 action = '持有观望'; icon = '🟡';
 desc = '偏多但信号不强。建议：维持底仓，等待更强信号。';
@@ -287,6 +346,9 @@ document.getElementById('kRsi').textContent = cur.rsi14 !== null ? cur.rsi14.toF
 document.getElementById('kRsi').style.color = cur.rsi14 < 30 ? 'var(--grn)' : cur.rsi14 > 70 ? 'var(--red)' : 'var(--txt)';
 document.getElementById('kBias').textContent = cur.bias20 !== null ? cur.bias20.toFixed(2) + '%' : '--';
 document.getElementById('kBias').style.color = cur.bias20 < -3 ? 'var(--grn)' : cur.bias20 > 3 ? 'var(--red)' : 'var(--txt)';
+document.getElementById('kDivYield').textContent = cur.divYield > 0 ? cur.divYield.toFixed(2) + '%' : '--';
+document.getElementById('kDivPct').textContent = cur.divPct !== null ? cur.divPct.toFixed(0) + '%' : '--';
+document.getElementById('kDivPct').style.color = cur.divPct > 70 ? 'var(--grn)' : cur.divPct < 30 ? 'var(--red)' : 'var(--txt)';
 
 // Signal list
 const sigHtml = signals.map(s => {
