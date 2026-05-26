@@ -141,34 +141,64 @@ return {dif,dea,bar};
 
 // ===== DIVIDEND YIELD PERCENTILE =====
 function calcDividendYield(data) {
-// Calculate rolling 12-month dividend yield from unitMoney field
-const yields = [];
+const now = Date.now();
 const msPerYear = 365.25 * 86400000;
+const yields = [];
+
+// First pass: calculate trailing 12-month yield (only past dividends)
 for (let i = 0; i < data.length; i++) {
-const now = data[i].ts;
-const oneYearAgo = now - msPerYear;
-// Sum dividends in trailing 12 months
+const t = data[i].ts;
+if (t > now) { yields.push(0); continue; } // skip future dates
+const oneYearAgo = t - msPerYear;
 let annualDiv = 0;
 for (let j = i; j >= 0; j--) {
 if (data[j].ts < oneYearAgo) break;
-if (data[j].div > 0) annualDiv += data[j].div;
+if (data[j].ts <= t && data[j].div > 0) annualDiv += data[j].div; // only past dividends
 }
-const yield_ = data[i].close > 0 ? annualDiv / data[i].close * 100 : 0;
-yields.push(yield_);
+yields.push(data[i].close > 0 ? annualDiv / data[i].close * 100 : 0);
 }
 
-// Calculate percentile for each point (trailing 252 trading days)
+// Second pass: percentile over 504 days (~2 years) for better statistical significance
 const percentiles = yields.map((y, i) => {
-const window = 252;
+if (data[i].ts > now) return null;
+const window = 504;
 const start = Math.max(0, i - window + 1);
 const slice = yields.slice(start, i + 1).filter(v => v > 0);
-if (slice.length < 20) return null;
+if (slice.length < 30) return null;
 const sorted = [...slice].sort((a, b) => a - b);
 const rank = sorted.filter(v => v <= y).length;
 return rank / sorted.length * 100;
 });
 
 return { yields, percentiles };
+}
+
+// ===== EX-DIVIDEND DETECTION =====
+function detectExDivDates(data) {
+// Find dates where dividend > 0 and price dropped more than the dividend amount
+// These are ex-dividend dates where the NAV drop is mechanical, not a real decline
+const exDivDates = new Set();
+for (let i = 1; i < data.length; i++) {
+if (data[i].div > 0) {
+const expectedDrop = data[i].div / data[i-1].close * 100;
+const actualDrop = (data[i-1].close - data[i].close) / data[i-1].close * 100;
+// If actual drop is close to expected dividend drop (within 2x), it's ex-div
+if (actualDrop > expectedDrop * 0.3 && actualDrop < expectedDrop * 3) {
+exDivDates.add(data[i].date);
+}
+}
+}
+return exDivDates;
+}
+
+// ===== DRAWDOWN FROM PEAK =====
+function calcDrawdown(closes, lookback = 60) {
+const dd = Array(closes.length).fill(null);
+for (let i = lookback; i < closes.length; i++) {
+const peak = Math.max(...closes.slice(i - lookback, i + 1));
+dd[i] = (closes[i] - peak) / peak * 100;
+}
+return dd;
 }
 
 // ===== SIGNAL ENGINE =====
@@ -186,6 +216,8 @@ const ma5 = sma(closes, 5);
 const ma20 = sma(closes, 20);
 const ma60 = sma(closes, 60);
 const divYield = calcDividendYield(data);
+const exDivDates = detectExDivDates(data);
+const drawdown = calcDrawdown(closes);
 
 // Current values
 const cur = {
@@ -203,6 +235,9 @@ ma20: ma20[last],
 ma60: ma60[last],
 divYield: divYield.yields[last],
 divPct: divYield.percentiles[last],
+drawdown: drawdown[last],
+isExDiv: exDivDates.has(data[last].date),
+dataDate: data[last].date,
 };
 
 // Evaluate signals (based on validated research)
@@ -261,6 +296,21 @@ else if (dp > 50) signals.push({ name: '股息率百分位', val: `${dp.toFixed(
 else if (dp < 15) signals.push({ name: '股息率百分位', val: `${dp.toFixed(0)}% (${dy.toFixed(2)}%)`, level: 'strong_sell', desc: '股息率处于历史低位，估值极高，谨慎', weight: 3.5 });
 else if (dp < 30) signals.push({ name: '股息率百分位', val: `${dp.toFixed(0)}% (${dy.toFixed(2)}%)`, level: 'sell', desc: '股息率偏低，估值偏高', weight: 2 });
 else signals.push({ name: '股息率百分位', val: `${dp.toFixed(0)}% (${dy.toFixed(2)}%)`, level: 'neutral', desc: '股息率中等，估值正常', weight: 0 });
+}
+
+// Drawdown from 60-day peak
+const dd = cur.drawdown;
+if (dd !== null) {
+if (dd < -15) signals.push({ name: '回撤幅度', val: dd.toFixed(1) + '%', level: 'strong_buy', desc: '大幅回撤，可能是恐慌性超跌', weight: 2 });
+else if (dd < -10) signals.push({ name: '回撤幅度', val: dd.toFixed(1) + '%', level: 'buy', desc: '显著回撤，关注加仓机会', weight: 1.5 });
+else if (dd < -5) signals.push({ name: '回撤幅度', val: dd.toFixed(1) + '%', level: 'weak_buy', desc: '温和回撤', weight: 0.5 });
+else if (dd > -1) signals.push({ name: '回撤幅度', val: dd.toFixed(1) + '%', level: 'neutral', desc: '接近高点，无回撤', weight: 0 });
+else signals.push({ name: '回撤幅度', val: dd.toFixed(1) + '%', level: 'neutral', desc: '小幅回撤', weight: 0 });
+}
+
+// Ex-dividend date warning
+if (cur.isExDiv) {
+signals.push({ name: '⚠️ 除息日', val: '今日', level: 'neutral', desc: '今日为除息日，净值下跌是分红扣除而非真实跌幅，技术指标可能失真', weight: 0 });
 }
 
 // ===== Composite decision =====
@@ -372,7 +422,7 @@ return `<div class="history-item"><div class="dot ${dotCls}"></div><div class="i
 addHistory(action, cur.price, date);
 
 // Footer
-document.getElementById('footer').textContent = `净值数据 · RSI/BIAS/MACD准确 · ${new Date().toLocaleString('zh-CN')}`;
+document.getElementById('footer').innerHTML = `净值数据(T+1延迟) · 数据日期: ${cur.dataDate} · RSI/BIAS/MACD/股息率准确 · ${new Date().toLocaleString('zh-CN')}`;
 
 document.getElementById('loading').style.display = 'none';
 document.getElementById('app').style.display = 'block';
