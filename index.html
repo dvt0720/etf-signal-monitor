@@ -176,30 +176,62 @@ PMI、利率、股债利差判断宏观状态，调整红利配比。</p>
 
 <script>
 // ===== DATA FETCHING =====
-function fetchKlines() {
+let DATA_SOURCE = 'nav'; // 'kline' or 'nav'
+
+function fetchKlinesJSONP(url, timeout) {
+return new Promise((resolve, reject) => {
+const cb = '_emCb_' + Date.now();
+const script = document.createElement('script');
+const timer = setTimeout(() => { cleanup(); reject(new Error('timeout')); }, timeout);
+function cleanup() { clearTimeout(timer); delete window[cb]; script.remove(); }
+window[cb] = (data) => { cleanup(); resolve(data); };
+script.onerror = () => { cleanup(); reject(new Error('network error')); };
+script.src = url + '&cb=' + cb;
+document.head.appendChild(script);
+});
+}
+
+function fetchNAV() {
 return new Promise((resolve, reject) => {
 const script = document.createElement('script');
-const timeout = setTimeout(() => { script.remove(); reject(new Error('请求超时')); }, 15000);
-
-// pingzhongdata sets global variables on window
+const timer = setTimeout(() => { script.remove(); reject(new Error('timeout')); }, 15000);
 script.onload = () => {
 try {
 const trend = window.Data_netWorthTrend;
 if (!trend || !trend.length) throw new Error('净值数据为空');
 const klines = trend.map(item => {
 const d = new Date(item.x);
-const dateStr = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
-return { date: dateStr, open: item.y, close: item.y, high: item.y, low: item.y, vol: 0, amount: 0, dividend: item.unitMoney || 0 };
+const ds = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+return { date: ds, open: item.y, close: item.y, high: item.y, low: item.y, vol: 0, amount: 0, dividend: item.unitMoney || 0 };
 });
-clearTimeout(timeout);
-script.remove();
-resolve(klines);
-} catch (e) { clearTimeout(timeout); script.remove(); reject(e); }
+clearTimeout(timer); script.remove(); resolve(klines);
+} catch (e) { clearTimeout(timer); script.remove(); reject(e); }
 };
-script.onerror = () => { clearTimeout(timeout); script.remove(); reject(new Error('数据加载失败')); };
+script.onerror = () => { clearTimeout(timer); script.remove(); reject(new Error('load failed')); };
 script.src = 'https://fund.eastmoney.com/pingzhongdata/159307.js';
 document.head.appendChild(script);
 });
+}
+
+async function fetchKlines() {
+// Try real K-line data first (works on domestic network)
+try {
+const url = 'https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=0.159307&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&klt=101&fqt=1&beg=20240101&end=20500101&lmt=1000';
+const data = await fetchKlinesJSONP(url, 8000);
+if (data && data.data && data.data.klines && data.data.klines.length > 100) {
+DATA_SOURCE = 'kline';
+return data.data.klines.map(k => {
+const p = k.split(',');
+return { date: p[0], open: +p[1], close: +p[2], high: +p[3], low: +p[4], vol: +p[5], amount: +p[6] };
+});
+}
+throw new Error('kline data insufficient');
+} catch (e) {
+// Fall back to NAV data
+console.log('K-line unavailable, falling back to NAV:', e.message);
+DATA_SOURCE = 'nav';
+return await fetchNAV();
+}
 }
 
 // ===== TECHNICAL INDICATORS =====
@@ -623,7 +655,8 @@ renderBacktest(backtestResults);
 
 document.getElementById('loading').style.display = 'none';
 document.getElementById('main').style.display = 'block';
-document.getElementById('updateTime').textContent = '数据更新: ' + new Date().toLocaleString('zh-CN') + ' · 共' + data.length + '个交易日';
+const srcLabel = DATA_SOURCE === 'kline' ? '✅ 真实K线数据（信号准确）' : '⚠️ 净值数据（KDJ/量比不精确，RSI/BIAS/MACD可用）';
+document.getElementById('updateTime').textContent = '数据更新: ' + new Date().toLocaleString('zh-CN') + ' · 共' + data.length + '个交易日 · ' + srcLabel;
 
 } catch (err) {
 document.getElementById('loading').innerHTML = `<p style="color:var(--red)">加载失败: ${err.message}</p><p style="color:var(--dim);margin-top:8px">请在有网络的环境下打开此页面</p>`;
